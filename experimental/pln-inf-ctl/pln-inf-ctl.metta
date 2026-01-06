@@ -20,7 +20,7 @@
 ;; ;;;;;;;;;;;;; ;;
 ;;;;;;;;;;;;;;;;;;;
 
-!(import! &self random)
+; !(import! &self random)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; ;;;;;;;;;;;;;;;;;;;;;; ;;
@@ -30,7 +30,7 @@
 
 ;; Boolean parameter to determine whether the search for random seeds
 ;; is enabled.  Warning: if is enabled, it may run for a long time.
-!(bind! &seed-search True)
+; !(bind! &seed-search True)
 
 ;; Not supported yet
 ;; ;; Set this parameter to True if you want to print debug traces on
@@ -42,6 +42,7 @@
 ;; ;; Utils ;; ;;
 ;; ;;;;;;;;;;; ;;
 ;;;;;;;;;;;;;;;;;
+!(import! &self ../lib/lib_he)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Add Atom without Duplicate ;;
@@ -93,13 +94,13 @@
 ;; Number ;;
 ;;;;;;;;;;;;
 
-;; Return the minimum between two values
-(: min (-> Number Number Number))
-(= (min $x $y) (if (< $x $y) $x $y))
+; ;; Return the minimum between two values
+; (: min (-> Number Number Number))
+; (= (min $x $y) (if (< $x $y) $x $y))
 
-;; Return the minimum between two values
-(: max (-> Number Number Number))
-(= (max $x $y) (if (< $x $y) $y $x))
+; ;; Return the minimum between two values
+; (: max (-> Number Number Number))
+; (= (max $x $y) (if (< $x $y) $y $x))
 
 ;;;;;;;;;;;;;;;;;;;;;
 ;; De Bruijn Index ;;
@@ -146,7 +147,7 @@
 
 ;; Test if the input is equal to a given value
 (: curried-equal-to (-> $a (-> $a Bool)))
-(= ((curried-equal-to $n) $x) (== $n $x))
+(= (curried-equal-to $n $x) (== $n $x))
 
 ;; Loop-like function ported from Haskell.  Iterate applying a given
 ;; function till some condition is reached.
@@ -285,14 +286,16 @@
          ($f $h $ft))))
 
 ;; Concatenate two terms
-(: append (-> $a $a $a))
-(= (append $lhs $rhs) (foldr cons-atom $rhs $lhs))
+;; Note: named `concat-atoms` to avoid clashing with Prolog's builtin
+;; `append/3` predicate when translated.
+(: concat-atoms (-> $a $a $a))
+(= (concat-atoms $lhs $rhs) (foldr cons-atom $rhs $lhs))
 
 ;; Concatenate two strings (implemented in my own branch)
 (: String.append (-> String String String))
 ;; (= (String.append $x $y) (call-fn! string_concat $x $y)) ; Only MeTTaLog
 (= (String.append $x $y) ((py-dot $x __add__ (-> String String String)) $y))
-;; (= (String.append $x $y) (charsToString (append (stringToChars $x) (stringToChars $y))))
+;; (= (String.append $x $y) (charsToString (concat-atoms (stringToChars $x) (stringToChars $y))))
 
 ;; Test String.append
 !(assertEqual (String.append "abc" "def") "abcdef")
@@ -1876,7 +1879,7 @@
                         Nat            ; Depth
                         $b             ; Query
                         Number)))      ; Estimate
-(= ((pln-estimate $pln-kb $pln-depth) $env $ctx $depth $query)
+(= (pln-estimate $pln-kb $pln-depth $env $ctx $depth $query)
    ;; (trace! (👁 pln-estimate $pln-kb $pln-depth $env $ctx $depth $query)
    (let* (;; Extract PLN statement reflecting the backward chainer query
           ($pln-stm (toPLN (toTheory $env) $ctx $depth $query))
