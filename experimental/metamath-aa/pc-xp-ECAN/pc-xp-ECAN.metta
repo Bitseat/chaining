@@ -8,6 +8,12 @@
 ;; Note that all type definitions over functions have been commented
 ;; out because it results in a significant speed up.
 
+;; This variant use the stock metta-attention agents.  
+;; Attention values live in the real bank (setAv / getSti / getLti /
+;; stimulate) and &af is populated, so getAfAtoms yields a live bounded focus
+;; and the diffusion and rent agents have targets to select.  What is still
+;; local: Hebbian link maintenance and the &pc-rb-af rule focus.
+
 ;;;;;;;;;;;;;;;;;;;;;;
 ;; ;;;;;;;;;;;;;;;; ;;
 ;; ;; Parameters ;; ;;
@@ -64,6 +70,76 @@
 ;; Use proof reduction as pruning mechanism during search
 (= (prune-reduct) False)
 
+;;;;;;;;;;;;;;;;;;;;;
+;; ECAN Parameters ;;
+;;;;;;;;;;;;;;;;;;;;;
+
+;; Initial short-term importance (STI) assigned to an axiom label when
+;; it is first inserted into the knowledge base.
+(= (ecan-axiom-sti) 100.0)
+
+;; Initial STI assigned to a (rule/arrow) lemma label on insertion.
+;; Used as a FLOOR only -- see ecan-seed-sti below.
+(= (ecan-rule-sti) 100.0)
+
+;; Extra STI given to a freshly proved lemma on top of the current
+;; maximum, so it enters the attentional focus at the very top.
+(= (ecan-seed-bonus) 1.0)
+
+;; STI increment applied to every label used in a discovered proof.
+(= (ecan-proof-stimulus) 1.0)
+
+;; Run diffusion/rent agents between theorem iterations.
+(= (ecan-use-agents) True)
+
+;; Run the ECAN agents CONTINUOUSLY, on a background thread, for the whole
+;; run -- instead of once between theorems.
+(= (ecan-background) True)
+
+;; Seconds the daemon sleeps between sweeps.  MUST be >= 1/AFRentFrequency
+;; (0.2 s at the stock value of 5.0) or every sweep falls under
+;; collectAFRent's elapsed-time threshold and rent never collects at all.
+(= (ecan-daemon-interval) 0.25)
+
+;; Whether the daemon also rebuilds &pc-rb-af.  With this False the running
+;; search keeps the focus it started with and only the NEXT theorem sees the
+;; daemon's work.  With it True the rule base is mutated underneath an
+;; in-flight search: each node's match sees a consistent snapshot, but
+;; different nodes can see different ones, so tier-1 completeness is no longer
+;; guaranteed.  That is survivable here only because a tier-1 miss falls
+;; through to the full rule base -- it costs time, never correctness.
+(= (ecan-daemon-steers-search) False)
+
+;; Size of the attention-focused rule base (&pc-rb-af) as a FRACTION of
+;; the rules currently in &pc-rb.
+(= (ecan-focus-fraction) 0.3)
+
+;; Lower bound on the focus. 
+(= (ecan-focus-min) 25)
+
+;; Number of highest-STI inference rules kept in the focus.
+(= (ecan-focus-size)
+   (let $n (size-atom (collapse (match &pc-rb (: $l $t) $l)))
+     (max (ecan-focus-min)
+          (trunc-math (* (ecan-focus-fraction) $n)))))
+
+;; Log per-iteration tier diagnostics (focused size / full size / whether
+;; the focused search hit) so the value of ECAN guidance can be measured.
+(= (ecan-log-tier) True)
+
+;; Weight of (normalised) LTI relative to STI when ranking rules for the
+;; focus.
+(= (ecan-lti-weight) 1.0)
+
+;; Blend rate pulling a Hebbian link's strength toward fresh co-use
+(= (ecan-hebbian-decay) 0.1)
+
+;; Nominal top of the STI range.  Its ONLY use is as the scale of the LTI
+;; term in ecan-rule-score: the most-used rule in the corpus receives an LTI
+;; bonus of exactly this many points, so the value sets how a perfect
+;; long-run record trades off against raw STI (see ecan-lti-weight).
+(= (ecan-sti-ceiling) 1000.0)
+
 ;;;;;;;;;;;;;;;;;;;;;;;
 ;; Logger Parameters ;;
 ;;;;;;;;;;;;;;;;;;;;;;;
@@ -72,7 +148,7 @@
 (= (log-level) debug)
 
 ;; Log file path
-(= (log-filepath) "pc-xp.log")
+(= (log-filepath) "pc-xp-ECAN.log")
 
 ;;;;;;;;;;;;;;;;;;;
 ;; ;;;;;;;;;;;;; ;;
@@ -82,22 +158,102 @@
 
 ;; Import logger library
 !(import! &self (library lib_import))
-!(git-import! "https://github.com/ngeiswei/petta_lib_logger")
-!(import! &self (library lib_logger))
+!(progn (translatePredicate (working_dir $this-dir))
+        (translatePredicate (atomic_list_concat ($this-dir "/repos") $repos-dir))
+        (git-import! "https://github.com/ngeiswei/petta_lib_logger" "" $repos-dir))
+
+;; Import metta-attention
+!(progn (translatePredicate (working_dir $ma-dir))
+        (translatePredicate (atomic_list_concat ($ma-dir "/repos") $ma-repos))
+        (git-import! "https://github.com/iCog-Labs-Dev/metta-attention" "" $ma-repos))
+!(progn (translatePredicate (working_dir $bg-dir))
+        (translatePredicate (atomic_list_concat ($bg-dir "/ecan_bg.pl") $bg-pl))
+        (translatePredicate (ensure_loaded $bg-pl)))
+
+!(import_prolog_functions_from_file (library petta_lib_logger lib_logger.pl)
+                                    (logger-set-filepath
+                                     logger-set-level
+                                     logger-info
+                                     logger-infof
+                                     logger-debugf
+                                     logger-tracef))
 
 ;; Import the propositional calculus corpus in the format
 ;; (MkIndexed INDEX (MkAxiom LABEL AXIOM))
 ;; (MkIndexed INDEX (MkTheorem LABEL PROOF THEOREM))
 !(if (reverse-arguments)
-     (import! &pc-idxd propositional-calculus-reversed-arguments)
-     (import! &pc-idxd propositional-calculus))
+     (import! &pc-idxd ../../metamath/propositional-calculus-reversed-arguments)
+     (import! &pc-idxd ../../metamath/propositional-calculus))
+
+;; Attention state and dynamics come from the metta-attention modules.
+!(import! &self (library lib_spaces))
+
+;; (library lib_he) supplies `unify', which diffuseIncident uses to look up
+; an atom's incident set.
+!(import! &self (library lib_he))
+
+;; No-op stub for the AF's CSV hook.
+(= (write_csv_wrapper $x) ())
+
+!(import! &self repos/metta-attention/attention/AttentionParam)
+!(import! &self repos/metta-attention/attention-bank/utilities/helper-functions)
+!(import! &self repos/metta-attention/attention-bank/bank/importance-index/importance-index)
+!(import! &self repos/metta-attention/attention-bank/attention-value/getter-and-setter)
+!(import! &self repos/metta-attention/attention-bank/bank/attention-bank)
+!(import! &self repos/metta-attention/attention-bank/bank/attentional-focus/attentional-focus)
+!(import! &self repos/metta-attention/attention/Neighbors)
+!(import! &self repos/metta-attention/attention/baching)
+!(import! &self repos/metta-attention/attention/ImportanceDiffusionAgent/ImportanceDiffusionBase/ImportanceDiffusionBase)
+!(import! &self repos/metta-attention/attention/RentCollectionAgent/RentCollectionBaseAgent/RentCollectionBaseAgent)
+
+;; Python helper used by the diffusion agent's top-k selection.
+!(import! &self repos/metta-attention/attention/ImportanceDiffusionAgent/getelement.py)
+!(import! &self repos/metta-attention/attention/ImportanceDiffusionAgent/AFImportanceDiffusionAgent/AFImportanceDiffusionAgent)
+!(import! &self repos/metta-attention/attention/RentCollectionAgent/AFRentCollectionAgent/AFRentCollectionAgent)
+
+;; import! cannot report a failure, so check for one.  getSti answers 0.0 for
+;; an atom with no attention value once the bank is loaded, and stays the
+;; unevaluated expression (getSti ...) when it is not.  Stop here rather than
+;; let an unevaluated expression reach `is/2' mid-run.
+!(if (== (getSti ecan-import-probe) 0.0)
+     ()
+     (progn
+      (println! "FATAL: metta-attention did not load -- getSti/setAv/stimulate are undefined.")
+      (println! "Expected the bank under <this file's dir>/repos/metta-attention; see the git-import! above.")
+      (translatePredicate (halt 1))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Attention economy (AttentionParam) ;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+!(updateAttentionParam HEBBIAN_MAX_ALLOCATION_PERCENTAGE 1.0)
+
+;; Rent and wages are two sides of one homeostat, both driven by how far
+;; FUNDS_STI sits from TARGET_STI, in units of STI_FUNDS_BUFFER:
+;;   wage = STI_ATOM_WAGE      * (1 + clamp((FUNDS_STI - TARGET_STI)/buffer, -1, 1))
+;;   rent = StartingAtomStiRent* (1 + clamp((TARGET_STI - FUNDS_STI)/buffer, -0.99, 1))
+;;          ... and is EXACTLY 0.0 whenever FUNDS_STI >= TARGET_STI.
+!(updateAttentionParam STARTING_FUNDS_STI 250000)
+!(updateAttentionParam FUNDS_STI 250000)
+!(updateAttentionParam TARGET_STI 220000)
+!(updateAttentionParam STI_FUNDS_BUFFER 120000)
 
 ;;;;;;;;;;;;;;;;;;;;;;
 ;; Configure Logger ;;
 ;;;;;;;;;;;;;;;;;;;;;;
 
+;; Control space for the background ECAN daemon: liveness flag and the
+;; resolved log path (see ecan-background).  Bound here because the logger
+;; block below writes into it.
+!(bind! &ecan-ctl (new-space))
 !(logger-set-level (log-level))
-!(logger-set-filepath (log-filepath))
+!(progn (translatePredicate (working_dir $this-dir))
+        (translatePredicate (atomic_list_concat ($this-dir "/" (log-filepath)) $log-path))
+        (logger-set-filepath $log-path)
+        ;; Keep the resolved path: a hyperpose worker thread has to set the
+        ;; logger up again for itself (see ecan-run-experiment), and cannot
+        ;; recompute it -- working_dir does not resolve the same way there.
+        (add-atom &ecan-ctl (logpath $log-path)))
 
 ;;;;;;;;;;;;;;;;;;;;;
 ;; ;;;;;;;;;;;;;;; ;;
@@ -840,17 +996,278 @@
 ;; Callback ;;
 ;;;;;;;;;;;;;;
 
-;; Callback to be passed to the backward chainer.  It is called over
-;; every result, intermediary included, that the backward chainer
-;; finds.  For now it used as a reduction pruner, meaning that if the
-;; result is recognized as reducible, then it is pruned.
+; ;; Callback to be passed to the backward chainer.  It is called over
+; ;; every result, intermediary included, that the backward chainer
+; ;; finds.  For now it used as a reduction pruner, meaning that if the
+; ;; result is recognized as reducible, then it is pruned.
+; ;; (: callback (-> $a $a))
+; (= (callback (: $x $a)) ; (: $x $a))
+;    (progn
+;     ;; (logger-tracef "Call: (callback %w)" ((: $x $a)))
+;     (if (prune-reduct)
+;         (prune-reduce (: $x $a))
+;         (: $x $a))))
+
+;; It can store results, or filter by returning (empty).
+;; It is the IDENTITY here, deliberately.  callback runs on the chainer's
+;; hot path -- every intermediary result, millions of times in a long
+;; search -- so anything done here is paid per search step; the bank's
+;; setAv alone costs ~5.9x a plain space write.  Attention is credited
+;; once per SUCCESSFUL proof instead (ecan-stimulate-proof), which is also
+;; the better signal: "appeared in a proof that worked" rather than "was
+;; touched while exploring a branch that failed".
 ;; (: callback (-> $a $a))
-(= (callback (: $x $a)) ; (: $x $a))
+(= (callback (: $x $a)) (: $x $a))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; ECAN Helper Functions ;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; Thin wrappers over the bank's getSti/getLti/getVlti/setAv/stimulate.
+
+;; atom_concat is a PeTTa builtin, so this costs one Prolog atom_concat per
+;; bank access.  Keep the "L-" prefix out of every OTHER space: &pc-rb,
+;; &pc-ab, &pc-rb-af and &labels are all keyed by the raw label.
+(= (ecan-key $l) (atom_concat "L-" $l))
+
+;; Current STI of a label (0.0 when it has none).
+(= (ecan-get-sti $l) (getSti (ecan-key $l)))
+
+;; Set the STI of a label, replacing any previous value.
+(= (ecan-set-sti $l $v)
+   (with_mutex ecan_bank
+     (let $k (ecan-key $l)
+       (setAv $k ($v (getLti $k) (getVlti $k))))))
+
+;; Current LTI of a label (0.0 when it has none).
+(= (ecan-get-lti $l) (getLti (ecan-key $l)))
+
+;; Labels of all inference rules currently in the knowledge base.
+(= (ecan-kb-rule-labels)
+   (collapse (match &pc-rb (: $l $t) $l)))
+
+;; Highest LTI currently recorded (0.0 if none), used to normalise the
+;; LTI term when ranking rules for the focus.
+(= (ecan-max-lti)
+   (let $vs (collapse (let $ls (ecan-kb-rule-labels) (let $l (superpose $ls) (ecan-get-lti $l))))
+     (if (== $vs ()) 0.0 (max-atom $vs))))
+
+;; Stimulation for a label that appeared in a SUCCESSFUL proof.
+(= (ecan-stimulate-lasting $l $stimulus)
+   (with_mutex ecan_bank (stimulate (ecan-key $l) $stimulus)))
+
+;; Recursively stimulate all rule/axiom labels in a proof tree.
+(= (ecan-stimulate-proof $prf)
+   (if (== (get-metatype $prf) Symbol)
+       (ecan-stimulate-lasting $prf (ecan-proof-stimulus))
+       (if (and (== (get-metatype $prf) Expression)
+                (not (== () $prf)))
+           (ecan-stimulate-proof-elems $prf)
+           ())))
+
+;; Walk a tuple of proof sub-terms, stimulating each.
+(= (ecan-stimulate-proof-elems $elems)
+   (if (== $elems ())
+       ()
+       (progn
+        (ecan-stimulate-proof (car-atom $elems))
+        (ecan-stimulate-proof-elems (cdr-atom $elems)))))
+
+;; Take the first $n elements of a tuple.  Guard with <= 0 rather than
+;; == 0: a fractional or negative bound would step straight past an
+;; equality test and recurse until the tuple ran out (or forever).
+(= (take-n $n $tuple)
+   (if (or (<= $n 0) (== $tuple ()))
+       ()
+       (cons-atom (car-atom $tuple)
+                  (take-n (- $n 1) (cdr-atom $tuple)))))
+
+;; Focus ranking score: short-term importance (what is hot now, driven by
+;; recency seeding and stimulation) plus normalised long-term importance
+;; (what has repeatedly proved useful).  Negated so a plain ascending
+;; sort-atom puts the best rules first.
+(= (ecan-rule-score $lbl $max-lti)
+   (* -1.0
+      (+ (ecan-get-sti $lbl)
+         (if (<= $max-lti 0.0)
+             0.0
+             (* (ecan-lti-weight)
+                (* (ecan-sti-ceiling)
+                   (/ (ecan-get-lti $lbl) $max-lti)))))))
+
+;; R-tagged intermediate: an untagged ($lbl $typ) 2-tuple reduces when
+;; the label collides with a builtin (e.g. the corpus label `id`).
+(= (ecan-scored-rules)
+   (let $max-lti (ecan-max-lti)
+     (collapse
+      (let (R $lbl $typ) (match &pc-rb (: $lbl $typ) (R $lbl $typ))
+        ((ecan-rule-score $lbl $max-lti) $lbl $typ)))))
+
+;; Rebuild the attention-focused rule base as the top (ecan-focus-size)
+;; inference rules by STI.  Axioms live in &pc-ab and are always
+;; available; only the *rules* the search may apply are restricted here.
+(= (ecan-rebuild-focused-rb)
+   (with_mutex ecan_bank
    (progn
-    ;; (logger-tracef "Call: (callback %w)" ((: $x $a)))
-    (if (prune-reduct)
-        (prune-reduce (: $x $a))
-        (: $x $a))))
+    ;; Clear old AF rule-base entries
+    (let $old (collapse (match &pc-rb-af $e $e))
+      (collapse (let $e (superpose $old) (remove-atom &pc-rb-af $e))))
+    ;; Keep the stock attentional focus (&af) sized to our focus, so
+    ;; getAfAtoms and this rule focus stay in step.  updateAf evicts the
+    ;; lowest-STI atom once &af reaches MAX_AF_SIZE.
+    (updateAttentionParam MAX_AF_SIZE (ecan-focus-size))
+    ;; Select the top-N rules and populate &pc-rb-af
+    (let* (($scored (ecan-scored-rules))
+           ($sorted (sort-atom $scored))
+           ($top-n (take-n (ecan-focus-size) $sorted)))
+      (collapse
+       (let ($neg-sti $lbl $typ) (superpose $top-n)
+         (add-atom &pc-rb-af (: $lbl $typ))))))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; ECAN Pipeline: Hebbian links (lean port)   ;;
+;; plus the STOCK diffusion and rent agents   ;;
+;;                                            ;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; Hebbian link creation/update stays local because
+;; HebbianCreationAgent-Run draws its sources from the AF rather than from
+;; the labels co-used in a proof, which is the signal we actually have;
+;; &pc-rb-af, the RULE focus the two-tier search uses, which is a different
+;; population from the bank's &af (that holds every atom with an attention
+;; value).
+
+;; All symbols occurring in a proof tree, as a flat tuple (explicit
+;; car/cdr walk.
+(= (ecan-proof-symbols $prf)
+   (if (== (get-metatype $prf) Symbol)
+       ($prf)
+       (if (and (== (get-metatype $prf) Expression)
+                (not (== () $prf)))
+           (ecan-proof-symbols-elems $prf)
+           ())))
+
+(= (ecan-proof-symbols-elems $elems)
+   (if (== $elems ())
+       ()
+       (concat-atom (ecan-proof-symbols (car-atom $elems))
+                    (ecan-proof-symbols-elems (cdr-atom $elems)))))
+
+;; True iff the label is a rule or axiom in the knowledge bases (filters
+;; out λ, premise variables like mp2.1, etc.).
+(= (ecan-is-kb-label $l)
+   (if (== () (collapse (match &pc-rb (: $l $t) True)))
+       (not (== () (collapse (match &pc-ab (: $l $t) True))))
+       True))
+
+;; Unique KB labels used in a proof.
+(= (ecan-proof-kb-labels $prf)
+   (let $syms (unique-atom (ecan-proof-symbols $prf))
+     (collapse
+      (let $s (superpose $syms)
+        (if (ecan-is-kb-label $s) $s (empty))))))
+
+;; Create or strengthen the Hebbian link SRC->TGT (HebbianCreationAgent's
+;; addHebbian initialises at (0.5 0.1); HebbianUpdatingAgent blends the
+;; strength toward fresh evidence with TC_DECAY_RATE — here the direct
+;; co-use of both labels in one proof counts as evidence 1.0).
+;; Hebbian links are kept in the exact shape diffuseHebbian matches:
+;;   ((ASYMMETRIC_HEBBIAN_LINK SRC TGT) (STV MEAN CONF))
+(= (ecan-update-hebbian-pair $a $b)
+   (case (once (match &hebbian-stock ((ASYMMETRIC_HEBBIAN_LINK $a $b) (STV $m $c))
+                      ($m $c)))
+     ((($m $c)
+       (let* (($decay (ecan-hebbian-decay))
+              ($new-m (+ (* $decay 1.0) (* (- 1.0 $decay) $m)))
+              ($new-c (min-atom ((+ $c 0.05) 0.95))))
+         (progn
+          (remove-atom &hebbian-stock
+                       ((ASYMMETRIC_HEBBIAN_LINK $a $b) (STV $m $c)))
+          (add-atom &hebbian-stock
+                    ((ASYMMETRIC_HEBBIAN_LINK $a $b) (STV $new-m $new-c))))))
+      (Empty (add-atom &hebbian-stock
+                       ((ASYMMETRIC_HEBBIAN_LINK $a $b) (STV 0.5 0.1)))))))
+
+;; Create/strengthen links between every ordered pair of distinct labels
+;; co-used in a proof (HebbianCreationAgent semantics over the co-focused
+;; set — here the co-used set, the direct evidence available to us).
+;; Takes RAW labels and converts to bank keys here, so callers keep working
+;; in the label vocabulary every other space uses.
+(= (ecan-update-hebbian-links $labels)
+   (collapse
+    (let* (($a (superpose $labels))
+           ($b (superpose $labels)))
+      (if (== $a $b)
+          ()
+          (let* (($ka (ecan-key $a))
+                 ($kb (ecan-key $b)))
+            (ecan-update-hebbian-pair $ka $kb))))))
+
+;; Labels currently in the attentional focus (&pc-rb-af).
+(= (ecan-focus-labels)
+   (collapse (match &pc-rb-af (: $l $t) $l)))
+
+;; One background sweep.  Kept separate from ecan-run-agents so the daemon
+;; does not emit the per-iteration diagnostic line on every tick.
+;; The WHOLE sweep is serialised against the main thread's bank access.
+(= (ecan-sweep)
+   (with_mutex ecan_bank
+   (progn
+    (add-atom &ecan-ctl (tick))
+    (catch (collapse (AFImportanceDiffusionAgent-Run &incident &hebbian-stock)))
+    (catch (collapse (AFRentCollectionAgent-run)))
+    (if (ecan-daemon-steers-search) (catch (ecan-rebuild-focused-rb)) ()))))
+
+;; The background loop.  Exits when the foreground clears the running flag.
+(= (ecan-daemon)
+   (if (== () (collapse (match &ecan-ctl (running True) 1)))
+       (progn (add-atom &ecan-ctl (stopped)) done)
+       (progn
+        (catch (ecan-sweep))
+        (catch (translatePredicate (sleep (ecan-daemon-interval))))
+        (ecan-daemon))))
+
+;; Wait (bounded) for the daemon thread to observe the cleared flag and exit.
+(= (ecan-await-daemon $tries)
+   (if (<= $tries 0)
+       timeout
+       (if (== () (collapse (match &ecan-ctl (stopped) 1)))
+           (progn (catch (translatePredicate (sleep 0.05)))
+                  (ecan-await-daemon (- $tries 1)))
+           stopped)))
+
+(= (ecan-daemon-stop)
+   (progn
+    (collapse (match &ecan-ctl (running True) (remove-atom &ecan-ctl (running True))))
+    (ecan-await-daemon 200)))
+
+;; Foreground branch: the experiment, then stop the daemon so hyperpose can join.
+(= (ecan-run-agents)
+   (if (ecan-use-agents)
+       (progn
+        (catch (collapse (AFImportanceDiffusionAgent-Run &incident &hebbian-stock)))
+        (catch (collapse (AFRentCollectionAgent-run)))
+        ;; Diagnostic only -- but a single empty result anywhere in the
+        ;; argument tuple makes the whole logger-debugf fail, which
+        ;; propagates out of this progn and silently ends the until loop.
+        ;; So every bank lookup here is collapsed: a diagnostic must never
+        ;; be able to abort the experiment.
+        (if (ecan-log-tier)
+            (let $focus (ecan-focus-labels)
+              (let* (($sample (if (== $focus ()) none (car-atom $focus)))
+                     ($af (collapse (getAfAtoms)))
+                     ($sti (if (== $sample none)
+                               (0.0)
+                               (collapse (ecan-get-sti $sample)))))
+                (logger-debugf "  [ecan] af-size=%w sample=%w sti=%w funds=%w rent=%w wage=%w"
+                               ((if (== $af ()) 0 (size-atom (car-atom $af)))
+                                $sample
+                                (if (== $sti ()) 0.0 (car-atom $sti))
+                                (getAttentionParam FUNDS_STI)
+                                (calculateStiRent (getAttentionParam StartingAtomStiRent))
+                                (calculateSTIWage)))))
+            ()))
+       (empty)))
 
 ;;;;;;;;;;;;;;;;;;;;;;
 ;; Backward chainer ;;
@@ -1462,6 +1879,19 @@
 ;; (: ax-3 (→ (→ (¬ $𝜑) (¬ $𝜓)) (→ $𝜓 $𝜑)))
 !(bind! &pc-ab (new-space))
 
+;; Create the attention-focused rule base.
+!(bind! &pc-rb-af (new-space))
+
+;; Hebbian link space: (Heb SRC TGT MEAN CONF) records that labels SRC and
+;; TGT were used together in a discovered proof (asymmetric, like
+;; ASYMMETRIC_HEBBIAN_LINK in the HebbianCreationAgent).
+!(bind! &hebbian-stock (new-space))
+
+;; Incident space for the diffusion agent's non-Hebbian spreading.  Our
+;; labels are opaque symbols with no incoming/outgoing structure, so this
+;; stays empty; diffusion therefore flows purely along Hebbian links.
+!(bind! &incident (new-space))
+
 ;; Enable occurs check to detect cycles in unification (note that it
 ;; returns a variable, this is normal)
 !(translatePredicate (set_prolog_flag occurs_check True))
@@ -1471,10 +1901,22 @@
 ;; greek letters by variables.
 (= (add-to-kbs $label $stmt)
    (let $stmt-with-vars (replace-greeks-by-variables $stmt)
-     ;; Add to rule base or axiom base
-     (if (is-arrow $stmt)
-         (add-atom &pc-rb (: $label $stmt-with-vars))
-         (add-atom &pc-ab (: $label $stmt-with-vars)))))
+     (let $is-rule (is-arrow $stmt)
+       (progn
+        ;; Add to rule base or axiom base
+        (if $is-rule
+            (add-atom &pc-rb (: $label $stmt-with-vars))
+            (add-atom &pc-ab (: $label $stmt-with-vars)))
+        (ecan-set-sti $label
+                      (if $is-rule (ecan-seed-sti) (ecan-axiom-sti)))))))
+
+;; Seed STI for a newly proved lemma: just above the highest STI in the
+;; system, with (ecan-rule-sti) as a floor for the very first lemmas.
+(= (ecan-seed-sti)
+   (let $vals (collapse (let $ls (ecan-kb-rule-labels) (let $l (superpose $ls) (ecan-get-sti $l))))
+     (if (== $vals ())
+         (ecan-rule-sti)
+         (max (ecan-rule-sti) (+ (max-atom $vals) (ecan-seed-bonus))))))
 
 ;; Add proof and theorem to label mapping to labels space
 (= (add-to-labels $proof $theorem $label)
@@ -1533,6 +1975,44 @@
                 (bc &pc-rb &pc-ab callback $pdepth (: $proof-wo-bdy $thrm))
                 (once (bc &pc-rb &pc-ab callback $pdepth (: $proof-wo-bdy $thrm)))))))))
 
+;; ECAN-guided rediscovery of proof(s) of a theorem.  It searches the
+;; attention-focused rule base (&pc-rb-af, rebuilt from the current
+;; attentional focus) FIRST; on a miss it falls back to the full &pc-rb.
+;; Each tier is wrapped in `collapse` so a miss yields () (a value)
+;; rather than a hard Prolog failure -- and each obc call is the only
+;; one inside its own collapse.
+(= (rediscover-proofs-ecan $bound $proof $thrm)
+   (let $proof-wo-bdy (replace-body-by-variable $proof)
+     ;; Rebuild the focused rule base from the current attentional focus.
+     (let $_ (catch (ecan-rebuild-focused-rb))
+       ;; Tier 1: search the attention-focused rule base.
+       (let $af-result-raw
+           (catch
+            (collapse
+             (if (search-all-proofs)
+                 (obc &pc-rb-af &pc-ab callback $bound (: $proof-wo-bdy $thrm))
+                 (once (obc &pc-rb-af &pc-ab callback $bound (: $proof-wo-bdy $thrm))))))
+         ;; Normalize a caught error to an empty result.
+         (let $af-result
+             (if (and (is-expression $af-result-raw)
+                      (== (car-atom $af-result-raw) Error))
+                 ()
+                 $af-result-raw)
+         ;; Tier diagnostics: focused rule count, full rule count, Tier-1 hit.
+         (let $_log (if (ecan-log-tier)
+                        (logger-infof "  [tier] focused=%w full=%w af-hit=%w"
+                                      ((size-atom (collapse (match &pc-rb-af (: $la $ta) $la)))
+                                       (size-atom (collapse (match &pc-rb (: $lb $tb) $lb)))
+                                       (not (== $af-result ()))))
+                        ())
+         (if (not (== $af-result ()))
+             $af-result
+             ;; Tier 2: fall back to the full rule base.
+             (collapse
+              (if (search-all-proofs)
+                  (obc &pc-rb &pc-ab callback $bound (: $proof-wo-bdy $thrm))
+                  (once (obc &pc-rb &pc-ab callback $bound (: $proof-wo-bdy $thrm))))))))))))
+
 ;; Process the theorem of a given index by rediscovering its proof, if
 ;; it succeeds then insert its alongside its proof(s) into the
 ;; propositional calculus knowledge bases and return the next idx, or
@@ -1542,26 +2022,31 @@
 ;; (: process-theorem-search (-> Number Number Assertion (Maybe Number)))
 (= (process-theorem-search $idx $bound (MkTheorem $label $proof $thrm))
    (progn
-    (if (bound-search-by-proof-size)
-        (logger-infof "Iteration %w: search proof of %w up to size %w"
-                      ($idx $label $bound))
-        (logger-infof "Iteration %w: search proof of %w up to depth %w"
-                      ($idx $label $bound)))
-    (let $prfs-thrms (rediscover-proofs $bound $proof $thrm)
+    (logger-infof "Iteration %w: ECAN-guided search proof of %w up to size %w"
+                  ($idx $label $bound))
+    (let $prfs-thrms (rediscover-proofs-ecan $bound $proof $thrm)
       (if (== $prfs-thrms ())
           ;; No proof
           (progn (logger-info "No proof found")
                  Nothing)
           ;; One or more proofs
           (progn
-           ;; For each proof add mapping from proof to label
+           ;; For each proof: map proof to label, stimulate the labels it
+           ;; uses, and create/strengthen Hebbian links between every pair
+           ;; of co-used labels (so future diffusion pre-activates them
+           ;; together).
            (collapse
             (let (: $p $t) (superpose $prfs-thrms)
                  (progn
                   (logger-infof "Found proof%w %w" (: $p))
-                  (add-to-labels $p $t $label))))
+                  (add-to-labels $p $t $label)
+                  (ecan-stimulate-proof $p)
+                  (ecan-update-hebbian-links (ecan-proof-kb-labels $p)))))
            ;; Add proved theorem as lemma in kbs
            (add-to-kbs $label $thrm)
+           ;; Run ECAN agents (diffusion + rent).  Skipped when the daemon is
+           ;; running them continuously on its own thread.
+           (if (ecan-background) () (ecan-run-agents))
            ;; Output next index
            (Just (+ $idx 1)))))))
 
@@ -1609,7 +2094,18 @@
 ;;;;;;;;;;;;;;;;;;;;;;;
 
 ;; Loop over all assertions of the corpus
-!(until equal-to-upidx-or-nothing process-assertion-m (Just 2))
+;; once commits to the first solution, so a failure can't unwind past it
+!(if (ecan-background)
+     (progn (add-atom &ecan-ctl (running True))
+            (translatePredicate (ecan_bg_start $bg-ok)))
+     ())
+!(once (until equal-to-upidx-or-nothing process-assertion-m (Just 2)))
+!(if (ecan-background)
+     (progn (ecan-daemon-stop)
+            (logger-infof "[bg] daemon sweeps=%w final-funds=%w"
+                          ((size-atom (collapse (match &ecan-ctl (tick) 1)))
+                           (getAttentionParam FUNDS_STI))))
+     ())
 
 ;; Log the content of pc-rb and pc-ab
 !(logger-debugf "pc-rb: %w" ((get-atoms &pc-rb)))
