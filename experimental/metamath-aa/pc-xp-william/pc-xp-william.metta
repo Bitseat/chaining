@@ -1,3 +1,10 @@
+;; WILLIAM-GUIDED proof search.  Identical to the base experiment except that
+;; each theorem is attempted FIRST against a focused rule base and only falls
+;; back to the full one on a miss.  The focus is chosen by Arthur Franz's
+;; WILLIAM/infcontrol premise selector, which scores the pair (goal, candidate)
+;; and returns the probability that the candidate is used in a proof of the
+;; goal.
+
 ;; Experiment to verify or rediscover proofs of the propositional
 ;; calculus fragment of set theory of Metamath.
 
@@ -64,6 +71,11 @@
 ;; Use proof reduction as pruning mechanism during search
 (= (prune-reduct) False)
 
+;; Use SUBSUMPTION pruning: prune any composite derivation of a statement
+;; that already carries a label, keeping only the direct use of that label.
+
+(= (subsume-reduct) False)
+
 ;;;;;;;;;;;;;;;;;;;;;;;
 ;; Logger Parameters ;;
 ;;;;;;;;;;;;;;;;;;;;;;;
@@ -72,7 +84,7 @@
 (= (log-level) debug)
 
 ;; Log file path
-(= (log-filepath) "pc-xp.log")
+(= (log-filepath) "pc-xp-william.log")
 
 ;;;;;;;;;;;;;;;;;;;
 ;; ;;;;;;;;;;;;; ;;
@@ -80,24 +92,38 @@
 ;; ;;;;;;;;;;;;; ;;
 ;;;;;;;;;;;;;;;;;;;
 
-;; Import logger library
+;; Import logger and infcontrol library.
 !(import! &self (library lib_import))
-!(git-import! "https://github.com/ngeiswei/petta_lib_logger")
-!(import! &self (library lib_logger))
+!(progn (translatePredicate (working_dir $this-dir))
+        (translatePredicate (atomic_list_concat ($this-dir "/repos") $repos-dir))
+        (git-import! "https://github.com/ngeiswei/petta_lib_logger" "" $repos-dir)
+        (git-import! "https://gitlab.com/occam_ua/infcontrol" "" $repos-dir))
+!(import_prolog_functions_from_file (library petta_lib_logger lib_logger.pl)
+                                    (logger-set-filepath
+                                     logger-set-level
+                                     logger-info
+                                     logger-infof
+                                     logger-debugf
+                                     logger-tracef))
 
 ;; Import the propositional calculus corpus in the format
 ;; (MkIndexed INDEX (MkAxiom LABEL AXIOM))
 ;; (MkIndexed INDEX (MkTheorem LABEL PROOF THEOREM))
 !(if (reverse-arguments)
-     (import! &pc-idxd propositional-calculus-reversed-arguments)
-     (import! &pc-idxd propositional-calculus))
+     (import! &pc-idxd ../../metamath/propositional-calculus-reversed-arguments)
+     (import! &pc-idxd ../../metamath/propositional-calculus))
 
 ;;;;;;;;;;;;;;;;;;;;;;
 ;; Configure Logger ;;
 ;;;;;;;;;;;;;;;;;;;;;;
 
 !(logger-set-level (log-level))
-!(logger-set-filepath (log-filepath))
+
+;; (log-filepath) is resolved against working_dir so the log lands beside
+;; this file rather than in whatever cwd run.sh was invoked from.
+!(progn (translatePredicate (working_dir $this-dir))
+        (translatePredicate (atomic_list_concat ($this-dir "/" (log-filepath)) $log-path))
+        (logger-set-filepath $log-path))
 
 ;;;;;;;;;;;;;;;;;;;;;
 ;; ;;;;;;;;;;;;;;; ;;
@@ -734,6 +760,27 @@
                ;; (logger-tracef "%w is in normal form, do not prune" ((: $x $a)))
                (: $x $a)))))))
 
+;; Subsumption pruning -- the automated reduction rule.
+;;
+;; Unlike prune-reduce, which needs the ONE recorded proof term to come back
+;; verbatim, this keys on the THEOREM alone: if the statement being derived
+;; already carries a label, then this derivation is redundant, because that
+;; label is in &pc-ab / &pc-rb and the chainer can reach the same statement in
+;; a single step.  So the rule set is exactly the set of proved lemmas, and it
+;; grows by itself every time add-to-labels runs -- nothing hand written.
+;;
+;; Only strictly composite derivations are pruned.  A bare symbol is the
+;; direct use of a label or axiom, which is precisely the derivation we want
+;; to keep, so it always survives.  The theorem currently under search cannot
+;; be pruned either: add-to-labels only runs after its proof is found, so it
+;; is not yet in &labels while the search for it is running.
+(= (subsume-reduce (: $x $a))
+   (if (is-expression $x)
+       (case (once (match &labels (Label $y $a $l) $l))
+         (($l (empty))
+          (Empty (: $x $a))))
+       (: $x $a)))
+
 ;; The code below, regular not pruning-based reduction, is only kept
 ;; for documentation or potential future use.
 
@@ -850,7 +897,9 @@
     ;; (logger-tracef "Call: (callback %w)" ((: $x $a)))
     (if (prune-reduct)
         (prune-reduce (: $x $a))
-        (: $x $a))))
+        (if (subsume-reduct)
+            (subsume-reduce (: $x $a))
+            (: $x $a)))))
 
 ;;;;;;;;;;;;;;;;;;;;;;
 ;; Backward chainer ;;
@@ -1471,10 +1520,13 @@
 ;; greek letters by variables.
 (= (add-to-kbs $label $stmt)
    (let $stmt-with-vars (replace-greeks-by-variables $stmt)
-     ;; Add to rule base or axiom base
-     (if (is-arrow $stmt)
-         (add-atom &pc-rb (: $label $stmt-with-vars))
-         (add-atom &pc-ab (: $label $stmt-with-vars)))))
+     (progn
+      ;; WILLIAM scores the pre-substitution form (see &pc-orig).
+      (add-atom &pc-orig (Orig $label $stmt))
+      ;; Add to rule base or axiom base
+      (if (is-arrow $stmt)
+          (add-atom &pc-rb (: $label $stmt-with-vars))
+          (add-atom &pc-ab (: $label $stmt-with-vars))))))
 
 ;; Add proof and theorem to label mapping to labels space
 (= (add-to-labels $proof $theorem $label)
@@ -1543,11 +1595,11 @@
 (= (process-theorem-search $idx $bound (MkTheorem $label $proof $thrm))
    (progn
     (if (bound-search-by-proof-size)
-        (logger-infof "Iteration %w: search proof of %w up to size %w"
+        (logger-infof "Iteration %w: WILLIAM-guided search proof of %w up to size %w"
                       ($idx $label $bound))
         (logger-infof "Iteration %w: search proof of %w up to depth %w"
                       ($idx $label $bound)))
-    (let $prfs-thrms (rediscover-proofs $bound $proof $thrm)
+    (let $prfs-thrms (rediscover-proofs-william $bound $proof $thrm)
       (if (== $prfs-thrms ())
           ;; No proof
           (progn (logger-info "No proof found")
@@ -1604,12 +1656,118 @@
 ;; (: process-assertion-m (-> (Maybe Number) (Maybe Number)))
 (= (process-assertion-m $midx) (Maybe.bind $midx process-assertion))
 
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; WILLIAM premise selection    ;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; The focused rule base.  Rebuilt before every theorem from WILLIAM's
+;; per-goal ranking, and searched before the full &pc-rb.
+!(bind! &pc-rb-af (new-space))
+
+;; Each label's ORIGINAL corpus statement -- the one that still spells
+;; variables as Greek letters.
+;;
+;; These cannot be taken from &pc-rb: add-to-kbs runs
+;; replace-greeks-by-variables first, so those copies repr as `$_3322', and
+;; infcontrol identifies a variable by its FIRST CHARACTER being Greek.  A
+;; `$_3322' would be scored as a constant symbol and every shared-variable
+;; feature would be wrong -- silently, with plausible-looking probabilities.
+;; All twelve variables this corpus uses are in infcontrol's GREEK_CHARS.
+!(bind! &pc-orig (new-space))
+
+;; Python bridge.  It shells out to infcontrol's predict_cli inside a
+;; virtualenv, so the system python PeTTa runs in needs no extra packages.
+!(import! &self william_rank.py)
+
+;; Size of the focus as a FRACTION of the rules currently in &pc-rb.
+(= (focus-fraction) 0.3)
+
+;; Lower bound on the focus.
+(= (focus-min) 25)
+
+;; How many rules the focus keeps.  Truncated to an integer -- take-n counts
+;; down to 0, so a fractional bound would never terminate exactly.
+(= (focus-size)
+   (let $n (size-atom (collapse (match &pc-rb (: $l $t) $l)))
+     (max (focus-min) (trunc-math (* (focus-fraction) $n)))))
+
+;; Log per-theorem tier diagnostics (focused size / full size / whether the
+;; focused search hit), so the selector's value can be measured.
+(= (log-tier) True)
+
+;; Take the first $n elements of a tuple.  
+(= (take-n $n $tuple)
+   (if (or (<= $n 0) (== $tuple ()))
+       ()
+       (cons-atom (car-atom $tuple)
+                  (take-n (- $n 1) (cdr-atom $tuple)))))
+
+;; Pair each probability with its label, negated, so a plain ascending
+;; sort-atom puts the most probable first.  W-tagged because an untagged
+;; 2-tuple reduces away when the label collides with a builtin -- the corpus
+;; label `id' is PeTTa's identity function.
+(= (william-zip $pairs $scores)
+   (if (or (== $pairs ()) (== $scores ()))
+       ()
+       (let* ((($ph $pt) (decons-atom $pairs))
+              (($sh $st) (decons-atom $scores))
+              ((P $lbl $stmt) $ph)
+              ($neg (* -1.0 $sh))
+              ($rest (william-zip $pt $st)))
+         (cons-atom (W $neg $lbl) $rest))))
+
+;; Rebuild &pc-rb-af as the (focus-size) rules WILLIAM rates most likely to
+;; appear in a proof of THIS goal.  Candidates are the inference rules only;
+;; axioms live in &pc-ab and are always available to the chainer anyway.
+(= (william-rebuild-focused-rb $goal)
+   (progn
+    (let $old (collapse (match &pc-rb-af $e $e))
+      (collapse (let $e (superpose $old) (remove-atom &pc-rb-af $e))))
+    (let $pairs (collapse (match &pc-rb (: $l $t)
+                            (let $s (match &pc-orig (Orig $l $os) $os) (P $l $s))))
+      (if (== $pairs ())
+          ()
+          (let* (($scores (py-call (william_rank.score (repr $goal) (repr $pairs))))
+                 ($scored (william-zip $pairs $scores))
+                 ($sorted (sort-atom $scored))
+                 ($top-n (take-n (focus-size) $sorted)))
+            (collapse
+             (let (W $neg $lbl) (superpose $top-n)
+               (let $ty (match &pc-rb (: $lbl $t) $t)
+                 (add-atom &pc-rb-af (: $lbl $ty))))))))))
+
+;; Two-tier rediscovery: the focused rule base first, the full one on a miss.
+(= (rediscover-proofs-william $bound $proof $thrm)
+   (let $proof-wo-bdy (replace-body-by-variable $proof)
+     (let $_ (catch (william-rebuild-focused-rb $thrm))
+       (let $af-raw
+           (catch
+            (collapse
+             (if (search-all-proofs)
+                 (obc &pc-rb-af &pc-ab callback $bound (: $proof-wo-bdy $thrm))
+                 (once (obc &pc-rb-af &pc-ab callback $bound (: $proof-wo-bdy $thrm))))))
+         (let $af-result
+             (if (and (is-expression $af-raw) (== (car-atom $af-raw) Error)) () $af-raw)
+         (let $_log (if (log-tier)
+                        (logger-infof "  [tier] focused=%w full=%w af-hit=%w"
+                                      ((size-atom (collapse (match &pc-rb-af (: $la $ta) $la)))
+                                       (size-atom (collapse (match &pc-rb (: $lb $tb) $lb)))
+                                       (not (== $af-result ()))))
+                        ())
+         (if (not (== $af-result ()))
+             $af-result
+             (collapse
+              (if (search-all-proofs)
+                  (obc &pc-rb &pc-ab callback $bound (: $proof-wo-bdy $thrm))
+                  (once (obc &pc-rb &pc-ab callback $bound (: $proof-wo-bdy $thrm))))))))))))
+
 ;;;;;;;;;;;;;;;;;;;;;;;
 ;; Process PC Corpus ;;
 ;;;;;;;;;;;;;;;;;;;;;;;
 
 ;; Loop over all assertions of the corpus
-!(until equal-to-upidx-or-nothing process-assertion-m (Just 2))
+!(once (until equal-to-upidx-or-nothing process-assertion-m (Just 2)))
 
 ;; Log the content of pc-rb and pc-ab
 !(logger-debugf "pc-rb: %w" ((get-atoms &pc-rb)))
