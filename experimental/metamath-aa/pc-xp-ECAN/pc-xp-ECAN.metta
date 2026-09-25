@@ -89,8 +89,29 @@
 ;; STI increment applied to every label used in a discovered proof.
 (= (ecan-proof-stimulus) 1.0)
 
-;; Run diffusion/rent agents between theorem iterations.
-(= (ecan-use-agents) True)
+;; MASTER SWITCH: ECAN-guided search, or the plain baseline?
+;;
+;; False turns the whole attention pipeline off and leaves the base experiment:
+;; one search over the full rule base, no focused first tier, no STI seeding, no
+;; stimulation, no Hebbian links, no agents and no daemon.  That is the honest
+;; control to compare ECAN against -- the same file, same chainer, same corpus,
+;; with only the guidance removed.
+;;
+;; It has to be checked in six places, because ECAN reaches into the run at six
+;; points: the two-tier search, STI seeding in add-to-kbs, proof stimulation,
+;; Hebbian link maintenance, the per-iteration agent call and the background
+;; daemon.  Gating only one of them (which is what (ecan-use-agents) alone did)
+;; leaves the focus mechanism running and is NOT a baseline.
+(= (ecan-enabled) True)
+
+;; Run diffusion/rent agents between theorem iterations.  Only consulted when
+;; (ecan-enabled) is True -- with ECAN off there are no agents to run.  Setting
+;; this False while ECAN is on is the narrower ablation: keep the focus and the
+;; Hebbian bookkeeping, drop diffusion and rent.
+(= (ecan-use-agents) False)
+
+;; AFRentCollectionAgent2 bills STI.  
+(= (ecan-rent-agent-2) True)
 
 ;; Run the ECAN agents CONTINUOUSLY, on a background thread, for the whole
 ;; run -- instead of once between theorems.
@@ -195,21 +216,9 @@
 ;; No-op stub for the AF's CSV hook.
 (= (write_csv_wrapper $x) ())
 
-!(import! &self repos/metta-attention/attention/AttentionParam)
-!(import! &self repos/metta-attention/attention-bank/utilities/helper-functions)
-!(import! &self repos/metta-attention/attention-bank/bank/importance-index/importance-index)
-!(import! &self repos/metta-attention/attention-bank/attention-value/getter-and-setter)
-!(import! &self repos/metta-attention/attention-bank/bank/attention-bank)
-!(import! &self repos/metta-attention/attention-bank/bank/attentional-focus/attentional-focus)
-!(import! &self repos/metta-attention/attention/Neighbors)
-!(import! &self repos/metta-attention/attention/baching)
-!(import! &self repos/metta-attention/attention/ImportanceDiffusionAgent/ImportanceDiffusionBase/ImportanceDiffusionBase)
-!(import! &self repos/metta-attention/attention/RentCollectionAgent/RentCollectionBaseAgent/RentCollectionBaseAgent)
-
-;; Python helper used by the diffusion agent's top-k selection.
-!(import! &self repos/metta-attention/attention/ImportanceDiffusionAgent/getelement.py)
-!(import! &self repos/metta-attention/attention/ImportanceDiffusionAgent/AFImportanceDiffusionAgent/AFImportanceDiffusionAgent)
-!(import! &self repos/metta-attention/attention/RentCollectionAgent/AFRentCollectionAgent/AFRentCollectionAgent)
+;; metta-attention ships a single entry point that pulls in the parameters,
+;; the bank, and every agent.
+!(import! &self (library metta-attention lib))
 
 ;; import! cannot report a failure, so check for one.  getSti answers 0.0 for
 ;; an atom with no attention value once the bank is loaded, and stays the
@@ -1207,6 +1216,12 @@
 (= (ecan-focus-labels)
    (collapse (match &pc-rb-af (: $l $t) $l)))
 
+;; Rent collection, dispatched by (ecan-rent-agent-2).  
+(= (ecan-collect-rent)
+   (if (ecan-rent-agent-2)
+       (AFRentCollectionAgent2-run)
+       (AFRentCollectionAgent-run)))
+
 ;; One background sweep.  Kept separate from ecan-run-agents so the daemon
 ;; does not emit the per-iteration diagnostic line on every tick.
 ;; The WHOLE sweep is serialised against the main thread's bank access.
@@ -1215,7 +1230,7 @@
    (progn
     (add-atom &ecan-ctl (tick))
     (catch (collapse (AFImportanceDiffusionAgent-Run &incident &hebbian-stock)))
-    (catch (collapse (AFRentCollectionAgent-run)))
+    (catch (collapse (ecan-collect-rent)))
     (if (ecan-daemon-steers-search) (catch (ecan-rebuild-focused-rb)) ()))))
 
 ;; The background loop.  Exits when the foreground clears the running flag.
@@ -1246,7 +1261,7 @@
    (if (ecan-use-agents)
        (progn
         (catch (collapse (AFImportanceDiffusionAgent-Run &incident &hebbian-stock)))
-        (catch (collapse (AFRentCollectionAgent-run)))
+        (catch (collapse (ecan-collect-rent)))
         ;; Diagnostic only -- but a single empty result anywhere in the
         ;; argument tuple makes the whole logger-debugf fail, which
         ;; propagates out of this progn and silently ends the until loop.
@@ -1267,7 +1282,9 @@
                                 (calculateStiRent (getAttentionParam StartingAtomStiRent))
                                 (calculateSTIWage)))))
             ()))
-       (empty)))
+       ;; () and not (empty): a zero-result branch here takes the whole
+       ;; enclosing progn with it and silently ends the corpus loop.
+       ()))
 
 ;;;;;;;;;;;;;;;;;;;;;;
 ;; Backward chainer ;;
@@ -1907,8 +1924,10 @@
         (if $is-rule
             (add-atom &pc-rb (: $label $stmt-with-vars))
             (add-atom &pc-ab (: $label $stmt-with-vars)))
-        (ecan-set-sti $label
-                      (if $is-rule (ecan-seed-sti) (ecan-axiom-sti)))))))
+        (if (ecan-enabled)
+            (ecan-set-sti $label
+                          (if $is-rule (ecan-seed-sti) (ecan-axiom-sti)))
+            ())))))
 
 ;; Seed STI for a newly proved lemma: just above the highest STI in the
 ;; system, with (ecan-rule-sti) as a floor for the very first lemmas.
@@ -1982,6 +2001,22 @@
 ;; rather than a hard Prolog failure -- and each obc call is the only
 ;; one inside its own collapse.
 (= (rediscover-proofs-ecan $bound $proof $thrm)
+   (if (ecan-enabled)
+       (rediscover-proofs-focused $bound $proof $thrm)
+       (rediscover-proofs-baseline $bound $proof $thrm)))
+
+;; Baseline: exactly what the base experiment does -- one search over the whole
+;; rule base, no focus, no tiers, so no [tier] line either (there is no tier to
+;; report).  Kept in the same collapse shape as the focused path so a miss is a
+;; value () rather than a hard failure that would unwind the corpus loop.
+(= (rediscover-proofs-baseline $bound $proof $thrm)
+   (let $proof-wo-bdy (replace-body-by-variable $proof)
+     (collapse
+      (if (search-all-proofs)
+          (obc &pc-rb &pc-ab callback $bound (: $proof-wo-bdy $thrm))
+          (once (obc &pc-rb &pc-ab callback $bound (: $proof-wo-bdy $thrm)))))))
+
+(= (rediscover-proofs-focused $bound $proof $thrm)
    (let $proof-wo-bdy (replace-body-by-variable $proof)
      ;; Rebuild the focused rule base from the current attentional focus.
      (let $_ (catch (ecan-rebuild-focused-rb))
@@ -2022,8 +2057,10 @@
 ;; (: process-theorem-search (-> Number Number Assertion (Maybe Number)))
 (= (process-theorem-search $idx $bound (MkTheorem $label $proof $thrm))
    (progn
-    (logger-infof "Iteration %w: ECAN-guided search proof of %w up to size %w"
-                  ($idx $label $bound))
+    ;; Say which mode actually ran -- a baseline run labelled "ECAN-guided"
+    ;; makes the logs of the two configurations impossible to tell apart.
+    (logger-infof "Iteration %w: %w search proof of %w up to size %w"
+                  ($idx (if (ecan-enabled) ECAN-guided baseline) $label $bound))
     (let $prfs-thrms (rediscover-proofs-ecan $bound $proof $thrm)
       (if (== $prfs-thrms ())
           ;; No proof
@@ -2040,13 +2077,18 @@
                  (progn
                   (logger-infof "Found proof%w %w" (: $p))
                   (add-to-labels $p $t $label)
-                  (ecan-stimulate-proof $p)
-                  (ecan-update-hebbian-links (ecan-proof-kb-labels $p)))))
+                  (if (ecan-enabled)
+                      (progn
+                       (ecan-stimulate-proof $p)
+                       (ecan-update-hebbian-links (ecan-proof-kb-labels $p)))
+                      ()))))
            ;; Add proved theorem as lemma in kbs
            (add-to-kbs $label $thrm)
            ;; Run ECAN agents (diffusion + rent).  Skipped when the daemon is
            ;; running them continuously on its own thread.
-           (if (ecan-background) () (ecan-run-agents))
+           (if (and (ecan-enabled) (not (ecan-background)))
+               (ecan-run-agents)
+               ())
            ;; Output next index
            (Just (+ $idx 1)))))))
 
@@ -2095,12 +2137,12 @@
 
 ;; Loop over all assertions of the corpus
 ;; once commits to the first solution, so a failure can't unwind past it
-!(if (ecan-background)
+!(if (and (ecan-enabled) (ecan-background))
      (progn (add-atom &ecan-ctl (running True))
             (translatePredicate (ecan_bg_start $bg-ok)))
      ())
 !(once (until equal-to-upidx-or-nothing process-assertion-m (Just 2)))
-!(if (ecan-background)
+!(if (and (ecan-enabled) (ecan-background))
      (progn (ecan-daemon-stop)
             (logger-infof "[bg] daemon sweeps=%w final-funds=%w"
                           ((size-atom (collapse (match &ecan-ctl (tick) 1)))
